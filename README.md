@@ -43,14 +43,18 @@ Kache/
 ### Steps
 
 # Clone the repo
+```
 git clone https://github.com/Shreyas-R-7925/Kache.git
 cd Kache
+```
 
 # Build
+```
 mkdir build
 cd build
 cmake ..
 make
+``` 
 
 # Run
 ./kache
