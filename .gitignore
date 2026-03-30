@@ -13,3 +13,6 @@ cmake_install.cmake
 # Executables
 kache
 *.out
+
+# Visual Studio Code settings
+.vscode/
