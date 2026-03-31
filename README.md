@@ -72,8 +72,6 @@ This design allows adding new storage engines without modifying existing code.
 
 ## 🚀 Future Improvements
 
-* TTL (key expiration)
-* LRU eviction policy
 * Persistence (disk storage)
 * Benchmarking (compare with Redis)
 * Unit testing
