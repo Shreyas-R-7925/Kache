@@ -1,15 +1,17 @@
 cmake_minimum_required(VERSION 3.10)
-
 project(Kache)
 
-# Use C++17
 set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Create executable
-add_executable(kache
-    src/main.cpp
+# Include headers
+include_directories(include)
+include_directories(src)
+
+# Source files
+set(SOURCES
     src/InMemoryStorage.cpp
+    src/LRUPolicy.cpp
+    src/main.cpp
 )
 
-target_include_directories(kache PRIVATE include)
+add_executable(kache ${SOURCES})
