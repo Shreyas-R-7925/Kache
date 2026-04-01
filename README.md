@@ -57,8 +57,10 @@ make
 ``` 
 
 # Run
+```
 ./kache
-
+./kache_server -> to run the TCP server
+```
 ---
 
 ## 🧠 Design
