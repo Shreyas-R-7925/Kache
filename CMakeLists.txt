@@ -9,9 +9,15 @@ include_directories(src)
 
 # Source files
 set(SOURCES
-    src/InMemoryStorage.cpp
-    src/LRUPolicy.cpp
+    src/service/InMemoryStorage.cpp
+    src/service/LRUPolicy.cpp
     src/main.cpp
 )
 
 add_executable(kache ${SOURCES})
+
+set(SERVER_SOURCES
+    src/server/TCPServer.cpp
+)
+
+add_executable(kache_server ${SERVER_SOURCES})
