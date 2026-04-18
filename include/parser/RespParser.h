@@ -1,14 +1,13 @@
 #pragma once
-#include <unordered_map>
-#include <memory>
-#include "IRespTypeParser.h"
+
+#include <string>
+#include <vector>
 
 class RespParser {
-private:
-    std::unordered_map<char, std::unique_ptr<IRespTypeParser>> parsers;
-
 public:
-    RespParser();
+    std::vector<std::string> parse(const std::string& rawBytes) const;
 
-    std::shared_ptr<RespValue> parse(Buffer& buffer);
+private:
+    static std::vector<std::string> parseInline(const std::string& rawBytes);
+    static std::vector<std::string> parseArray(const std::string& rawBytes);
 };
