@@ -1,69 +1,81 @@
-#include <iostream>
-#include <cstring>
-#include <unistd.h>
+#include "server/TCPServer.h"
+
 #include <arpa/inet.h>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <sys/socket.h>
+#include <unistd.h>
 
-#define PORT 6380
-#define BUFFER_SIZE 1024
+#include "parser/RespSerializer.h"
 
-int main() {
-    int server_fd, client_socket;
-    struct sockaddr_in address;
-    int opt = 1;
-    int addrlen = sizeof(address);
-    char buffer[BUFFER_SIZE] = {0};
+namespace {
+constexpr int kBacklog = 16;
+constexpr size_t kBufferSize = 4096;
+}
 
-    // 1. Create socket
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd == 0) {
-        perror("socket failed");
-        return 1;
+TCPServer::TCPServer(int port, std::shared_ptr<CommandHandler> commandHandler)
+    : port_(port), commandHandler_(std::move(commandHandler)) {}
+
+void TCPServer::run() const {
+    const int serverFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverFd < 0) {
+        throw std::runtime_error("Failed to create socket");
     }
 
-    // 2. Allow reuse of address/port
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    int reuseAddress = 1;
+    if (setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &reuseAddress, sizeof(reuseAddress)) < 0) {
+        close(serverFd);
+        throw std::runtime_error("Failed to set socket options");
+    }
 
-    // 3. Bind
+    sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT);
+    address.sin_port = htons(static_cast<uint16_t>(port_));
 
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        return 1;
+    if (bind(serverFd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
+        close(serverFd);
+        throw std::runtime_error("Failed to bind socket");
     }
 
-    // 4. Listen
-    if (listen(server_fd, 5) < 0) {
-        perror("listen");
-        return 1;
+    if (listen(serverFd, kBacklog) < 0) {
+        close(serverFd);
+        throw std::runtime_error("Failed to listen on socket");
     }
 
-    std::cout << "Server listening on port " << PORT << "...\n";
+    std::cout << "Kache listening on port " << port_ << '\n';
 
     while (true) {
-        // 5. Accept connection
-        client_socket = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
-        if (client_socket < 0) {
-            perror("accept");
+        socklen_t addressLength = sizeof(address);
+        const int clientFd = accept(serverFd, reinterpret_cast<sockaddr*>(&address), &addressLength);
+        if (clientFd < 0) {
+            std::cerr << "accept failed\n";
             continue;
         }
 
-        std::cout << "Client connected\n";
+        while (true) {
+            char buffer[kBufferSize] = {0};
+            const ssize_t bytesRead = read(clientFd, buffer, sizeof(buffer));
+            if (bytesRead <= 0) {
+                break;
+            }
 
-        // 6. Read data
-        int valread = read(client_socket, buffer, BUFFER_SIZE);
-        if (valread > 0) {
-            std::cout << "Received: " << buffer << std::endl;
-
-            // 7. Send response
-            const char* response = "OK\r\n";
-            send(client_socket, response, strlen(response), 0);
+            const std::string rawRequest(buffer, static_cast<size_t>(bytesRead));
+            const std::string response = handleRequest(rawRequest);
+            send(clientFd, response.c_str(), response.size(), 0);
         }
 
-        close(client_socket);
+        close(clientFd);
     }
+}
 
-    close(server_fd);
-    return 0;
+std::string TCPServer::handleRequest(const std::string& rawRequest) const {
+    try {
+        const std::vector<std::string> command = parser_.parse(rawRequest);
+        const RespReply reply = commandHandler_->handle(command);
+        return RespSerializer::serialize(reply);
+    } catch (const std::exception& exception) {
+        return RespSerializer::serialize(RespReply::error(std::string("ERR ") + exception.what()));
+    }
 }
