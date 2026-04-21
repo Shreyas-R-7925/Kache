@@ -16,5 +16,6 @@ private:
     std::shared_ptr<CommandHandler> commandHandler_;
     RespParser parser_;
 
+    void handleClient(int clientFd) const;
     std::string handleRequest(const std::string& rawRequest) const;
 };

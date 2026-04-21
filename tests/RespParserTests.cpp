@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -65,7 +66,9 @@ void testExpiryFlow() {
 
     const RespReply ttlReply = handler.handle({"TTL", "temp"});
     expect(ttlReply.type == RespReplyType::Integer, "TTL type mismatch");
-    expect(ttlReply.integerValue >= 0 && ttlReply.integerValue <= 1, "TTL range mismatch");
+    expect(
+        ttlReply.integerValue >= 0 && ttlReply.integerValue <= 1,
+        "TTL range mismatch: " + std::to_string(ttlReply.integerValue));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1200));
     expect(RespSerializer::serialize(handler.handle({"TTL", "temp"})) == ":-2\r\n", "expired TTL failed");
@@ -86,6 +89,73 @@ void testKeysAndFlushAll() {
     expect(RespSerializer::serialize(handler.handle({"KEYS", "*"})) == "*0\r\n", "empty KEYS failed");
 }
 
+void testConcurrentSetAndGet() {
+    auto storage = std::make_shared<InMemoryStorage>(CACHE_SIZE * 4, LRU_EVICTION_POLICY);
+
+    constexpr int threadCount = 10;
+    constexpr int operationsPerThread = 500;
+
+    std::atomic<bool> failed{false};
+    std::atomic<int> readyCount{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> workers;
+    workers.reserve(threadCount);
+
+    for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        workers.emplace_back([&, threadIndex]() {
+            readyCount.fetch_add(1);
+            while (!start.load()) {
+            }
+
+            for (int opIndex = 0; opIndex < operationsPerThread; ++opIndex) {
+                const std::string key = "thread:" + std::to_string(threadIndex) + ":key:" + std::to_string(opIndex % 25);
+                const std::string value = "value:" + std::to_string(threadIndex) + ":" + std::to_string(opIndex);
+
+                storage->set(key, value);
+                const auto stored = storage->get(key);
+
+                if (!stored.has_value() || stored.value() != value) {
+                    failed = true;
+                    return;
+                }
+            }
+        });
+    }
+
+    while (readyCount.load() != threadCount) {
+    }
+    start = true;
+
+    for (auto& worker : workers) {
+        worker.join();
+    }
+
+    expect(!failed.load(), "concurrent SET/GET stress test failed");
+
+    for (int threadIndex = 0; threadIndex < threadCount; ++threadIndex) {
+        for (int keyIndex = 0; keyIndex < 25; ++keyIndex) {
+            const std::string key = "thread:" + std::to_string(threadIndex) + ":key:" + std::to_string(keyIndex);
+            expect(storage->exists(key), "concurrent stress test lost key: " + key);
+        }
+    }
+}
+
+void testLruReadRefreshesRecency() {
+    auto storage = std::make_shared<InMemoryStorage>(2, LRU_EVICTION_POLICY);
+
+    storage->set("a", "1");
+    storage->set("b", "2");
+
+    const auto value = storage->get("a");
+    expect(value.has_value() && value.value() == "1", "LRU read refresh setup failed");
+
+    storage->set("c", "3");
+
+    expect(storage->exists("a"), "LRU should retain recently read key");
+    expect(!storage->exists("b"), "LRU should evict least recently used key");
+    expect(storage->exists("c"), "LRU should keep new key");
+}
+
 }  // namespace
 
 int main() {
@@ -96,6 +166,8 @@ int main() {
         testCommandFlow();
         testExpiryFlow();
         testKeysAndFlushAll();
+        testConcurrentSetAndGet();
+        testLruReadRefreshesRecency();
         std::cout << "All tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& exception) {

@@ -1,12 +1,12 @@
 #pragma once
 
-#include <atomic>
+#include <array>
 #include <chrono>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -18,7 +18,7 @@ using TimePoint = std::chrono::steady_clock::time_point;
 class InMemoryStorage : public StorageEngine {
 public:
     InMemoryStorage(size_t cap, const std::string& policyType);
-    ~InMemoryStorage() override;
+    ~InMemoryStorage() override = default;
 
     std::optional<std::string> get(const std::string& key) override;
     void set(const std::string& key, const std::string& value) override;
@@ -31,20 +31,29 @@ public:
     void flushAll() override;
 
 private:
+    static constexpr size_t kShardCount = 16;
+
     struct Entry {
         std::string value;
         std::optional<TimePoint> expiry;
     };
 
-    mutable std::mutex mutex_;
-    std::thread cleanupThread_;
-    std::atomic<bool> stopFlag_{false};
-    std::unordered_map<std::string, Entry> store_;
+    struct Shard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<std::string, Entry> store;
+    };
+
+    std::array<Shard, kShardCount> shards_;
+    mutable std::mutex metadataMutex_;
     std::unique_ptr<EvictionPolicy> policy_;
     size_t capacity_;
+    size_t size_ = 0;
 
     bool isExpired(const Entry& entry, TimePoint now) const;
-    bool purgeIfExpiredLocked(const std::string& key, TimePoint now);
-    void setInternalLocked(const std::string& key, const std::string& value, std::optional<TimePoint> expiry);
-    void cleanupExpiredKeys();
+    size_t shardIndexFor(const std::string& key) const;
+    Shard& shardFor(const std::string& key);
+    const Shard& shardFor(const std::string& key) const;
+    bool purgeIfExpiredLocked(Shard& shard, const std::string& key, TimePoint now);
+    bool eraseLocked(Shard& shard, const std::string& key);
+    void setInternal(const std::string& key, const std::string& value, std::optional<TimePoint> expiry);
 };

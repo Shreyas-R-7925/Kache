@@ -1,6 +1,7 @@
 #include "InMemoryStorage.h"
 
 #include <algorithm>
+#include <functional>
 #include <stdexcept>
 
 #include "../constants/KacheConstants.h"
@@ -12,27 +13,20 @@ InMemoryStorage::InMemoryStorage(size_t cap, const std::string& policyType) : ca
     } else {
         throw std::invalid_argument("Unsupported eviction policy");
     }
-
-    cleanupThread_ = std::thread(&InMemoryStorage::cleanupExpiredKeys, this);
-}
-
-InMemoryStorage::~InMemoryStorage() {
-    stopFlag_ = true;
-    if (cleanupThread_.joinable()) {
-        cleanupThread_.join();
-    }
 }
 
 std::optional<std::string> InMemoryStorage::get(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
     const auto now = std::chrono::steady_clock::now();
-
-    if (purgeIfExpiredLocked(key, now)) {
+    Shard& shard = shardFor(key);
+    std::lock_guard<std::mutex> metadataLock(metadataMutex_);
+    std::unique_lock<std::shared_mutex> shardLock(shard.mutex);
+    auto it = shard.store.find(key);
+    if (it == shard.store.end()) {
         return std::nullopt;
     }
 
-    auto it = store_.find(key);
-    if (it == store_.end()) {
+    if (isExpired(it->second, now)) {
+        purgeIfExpiredLocked(shard, key, now);
         return std::nullopt;
     }
 
@@ -41,46 +35,54 @@ std::optional<std::string> InMemoryStorage::get(const std::string& key) {
 }
 
 void InMemoryStorage::set(const std::string& key, const std::string& value) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    setInternalLocked(key, value, std::nullopt);
+    setInternal(key, value, std::nullopt);
 }
 
 void InMemoryStorage::set(const std::string& key, const std::string& value, std::chrono::seconds ttl) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    setInternalLocked(key, value, std::chrono::steady_clock::now() + ttl);
+    setInternal(key, value, std::chrono::steady_clock::now() + ttl);
 }
 
 bool InMemoryStorage::del(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (store_.erase(key) == 0) {
-        return false;
-    }
-
-    policy_->onDelete(key);
-    return true;
+    std::lock_guard<std::mutex> metadataLock(metadataMutex_);
+    Shard& shard = shardFor(key);
+    std::unique_lock<std::shared_mutex> shardLock(shard.mutex);
+    return eraseLocked(shard, key);
 }
 
 bool InMemoryStorage::exists(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
     const auto now = std::chrono::steady_clock::now();
+    Shard& shard = shardFor(key);
 
-    if (purgeIfExpiredLocked(key, now)) {
-        return false;
+    {
+        std::shared_lock<std::shared_mutex> shardLock(shard.mutex);
+        auto it = shard.store.find(key);
+        if (it == shard.store.end()) {
+            return false;
+        }
+
+        if (!isExpired(it->second, now)) {
+            return true;
+        }
     }
 
-    return store_.find(key) != store_.end();
+    std::lock_guard<std::mutex> metadataLock(metadataMutex_);
+    std::unique_lock<std::shared_mutex> shardLock(shard.mutex);
+    purgeIfExpiredLocked(shard, key, now);
+    return shard.store.find(key) != shard.store.end();
 }
 
 bool InMemoryStorage::expire(const std::string& key, std::chrono::seconds ttl) {
-    std::lock_guard<std::mutex> lock(mutex_);
     const auto now = std::chrono::steady_clock::now();
+    Shard& shard = shardFor(key);
+    std::lock_guard<std::mutex> metadataLock(metadataMutex_);
+    std::unique_lock<std::shared_mutex> shardLock(shard.mutex);
 
-    if (purgeIfExpiredLocked(key, now)) {
+    if (purgeIfExpiredLocked(shard, key, now)) {
         return false;
     }
 
-    auto it = store_.find(key);
-    if (it == store_.end()) {
+    auto it = shard.store.find(key);
+    if (it == shard.store.end()) {
         return false;
     }
 
@@ -89,15 +91,31 @@ bool InMemoryStorage::expire(const std::string& key, std::chrono::seconds ttl) {
 }
 
 long InMemoryStorage::ttl(const std::string& key) {
-    std::lock_guard<std::mutex> lock(mutex_);
     const auto now = std::chrono::steady_clock::now();
+    Shard& shard = shardFor(key);
 
-    if (purgeIfExpiredLocked(key, now)) {
-        return -2;
+    {
+        std::shared_lock<std::shared_mutex> shardLock(shard.mutex);
+        auto it = shard.store.find(key);
+        if (it == shard.store.end()) {
+            return -2;
+        }
+
+        if (!isExpired(it->second, now)) {
+            if (!it->second.expiry.has_value()) {
+                return -1;
+            }
+
+            const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(it->second.expiry.value() - now).count();
+            return remaining > 0 ? remaining : 0;
+        }
     }
 
-    auto it = store_.find(key);
-    if (it == store_.end()) {
+    std::lock_guard<std::mutex> metadataLock(metadataMutex_);
+    std::unique_lock<std::shared_mutex> shardLock(shard.mutex);
+    purgeIfExpiredLocked(shard, key, now);
+    auto it = shard.store.find(key);
+    if (it == shard.store.end()) {
         return -2;
     }
 
@@ -114,19 +132,14 @@ std::vector<std::string> InMemoryStorage::keys(const std::string& pattern) {
         throw std::invalid_argument("Only KEYS * is supported");
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto now = std::chrono::steady_clock::now();
     std::vector<std::string> result;
-
-    for (auto it = store_.begin(); it != store_.end();) {
-        if (isExpired(it->second, now)) {
-            policy_->onDelete(it->first);
-            it = store_.erase(it);
-            continue;
+    for (const auto& shard : shards_) {
+        std::shared_lock<std::shared_mutex> shardLock(shard.mutex);
+        for (const auto& [key, entry] : shard.store) {
+            if (!isExpired(entry, std::chrono::steady_clock::now())) {
+                result.push_back(key);
+            }
         }
-
-        result.push_back(it->first);
-        ++it;
     }
 
     std::sort(result.begin(), result.end());
@@ -134,56 +147,87 @@ std::vector<std::string> InMemoryStorage::keys(const std::string& pattern) {
 }
 
 void InMemoryStorage::flushAll() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock metadataLock(metadataMutex_);
 
-    for (const auto& [key, _] : store_) {
-        policy_->onDelete(key);
+    for (auto& shard : shards_) {
+        std::unique_lock<std::shared_mutex> shardLock(shard.mutex);
+        for (const auto& [key, _] : shard.store) {
+            policy_->onDelete(key);
+        }
+        shard.store.clear();
     }
 
-    store_.clear();
+    size_ = 0;
 }
 
 bool InMemoryStorage::isExpired(const Entry& entry, TimePoint now) const {
     return entry.expiry.has_value() && now >= entry.expiry.value();
 }
 
-bool InMemoryStorage::purgeIfExpiredLocked(const std::string& key, TimePoint now) {
-    auto it = store_.find(key);
-    if (it == store_.end() || !isExpired(it->second, now)) {
+size_t InMemoryStorage::shardIndexFor(const std::string& key) const {
+    return std::hash<std::string>{}(key) % kShardCount;
+}
+
+InMemoryStorage::Shard& InMemoryStorage::shardFor(const std::string& key) {
+    return shards_[shardIndexFor(key)];
+}
+
+const InMemoryStorage::Shard& InMemoryStorage::shardFor(const std::string& key) const {
+    return shards_[shardIndexFor(key)];
+}
+
+bool InMemoryStorage::purgeIfExpiredLocked(Shard& shard, const std::string& key, TimePoint now) {
+    auto it = shard.store.find(key);
+    if (it == shard.store.end() || !isExpired(it->second, now)) {
         return false;
     }
 
     policy_->onDelete(key);
-    store_.erase(it);
+    shard.store.erase(it);
+    --size_;
     return true;
 }
 
-void InMemoryStorage::setInternalLocked(const std::string& key, const std::string& value, std::optional<TimePoint> expiry) {
-    if (store_.find(key) == store_.end() && store_.size() >= capacity_) {
-        const std::string evictedKey = policy_->evict();
-        store_.erase(evictedKey);
+bool InMemoryStorage::eraseLocked(Shard& shard, const std::string& key) {
+    auto it = shard.store.find(key);
+    if (it == shard.store.end()) {
+        return false;
     }
 
-    store_[key] = Entry{value, expiry};
-    policy_->onSet(key);
+    policy_->onDelete(key);
+    shard.store.erase(it);
+    --size_;
+    return true;
 }
 
-void InMemoryStorage::cleanupExpiredKeys() {
-    while (!stopFlag_) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            const auto now = std::chrono::steady_clock::now();
+void InMemoryStorage::setInternal(const std::string& key, const std::string& value, std::optional<TimePoint> expiry) {
+    std::lock_guard<std::mutex> metadataLock(metadataMutex_);
+    Shard& shard = shardFor(key);
+    std::unique_lock<std::shared_mutex> shardLock(shard.mutex);
 
-            for (auto it = store_.begin(); it != store_.end();) {
-                if (isExpired(it->second, now)) {
-                    policy_->onDelete(it->first);
-                    it = store_.erase(it);
-                } else {
-                    ++it;
-                }
-            }
+    const auto now = std::chrono::steady_clock::now();
+    purgeIfExpiredLocked(shard, key, now);
+
+    auto it = shard.store.find(key);
+    const bool isInsert = it == shard.store.end();
+
+    if (isInsert && size_ >= capacity_) {
+        const std::string evictedKey = policy_->evict();
+        Shard& evictedShard = shardFor(evictedKey);
+        if (&evictedShard == &shard) {
+            eraseLocked(shard, evictedKey);
+        } else {
+            shardLock.unlock();
+            std::unique_lock<std::shared_mutex> evictedShardLock(evictedShard.mutex);
+            eraseLocked(evictedShard, evictedKey);
+            shardLock.lock();
         }
-
-        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
+
+    if (isInsert) {
+        ++size_;
+    }
+
+    shard.store[key] = Entry{value, expiry};
+    policy_->onSet(key);
 }
