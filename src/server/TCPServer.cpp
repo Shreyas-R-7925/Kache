@@ -5,6 +5,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
 
 #include "parser/RespSerializer.h"
@@ -53,21 +54,24 @@ void TCPServer::run() const {
             std::cerr << "accept failed\n";
             continue;
         }
+        std::thread(&TCPServer::handleClient, this, clientFd).detach();
+    }
+}
 
-        while (true) {
-            char buffer[kBufferSize] = {0};
-            const ssize_t bytesRead = read(clientFd, buffer, sizeof(buffer));
-            if (bytesRead <= 0) {
-                break;
-            }
-
-            const std::string rawRequest(buffer, static_cast<size_t>(bytesRead));
-            const std::string response = handleRequest(rawRequest);
-            send(clientFd, response.c_str(), response.size(), 0);
+void TCPServer::handleClient(int clientFd) const {
+    while (true) {
+        char buffer[kBufferSize] = {0};
+        const ssize_t bytesRead = read(clientFd, buffer, sizeof(buffer));
+        if (bytesRead <= 0) {
+            break;
         }
 
-        close(clientFd);
+        const std::string rawRequest(buffer, static_cast<size_t>(bytesRead));
+        const std::string response = handleRequest(rawRequest);
+        send(clientFd, response.c_str(), response.size(), 0);
     }
+
+    close(clientFd);
 }
 
 std::string TCPServer::handleRequest(const std::string& rawRequest) const {
