@@ -17,7 +17,8 @@ Kache is a lightweight in-memory key-value store inspired by Redis. It exposes a
   - arrays
   - null bulk strings
 - Thread-safe sharded in-memory storage
-- LRU eviction
+- Configurable `LRU` or `LFU` eviction
+- Registry-based eviction policy selection
 - TTL and expiry support
 - WAL persistence through `wal.log`
 - Snapshot persistence through `snapshot.rdb`
@@ -96,6 +97,9 @@ FLUSHALL
 ```
 
 - On startup, Kache replays the WAL to rebuild the latest state.
+- WAL stores write history, not a final materialized cache image.
+- Runtime eviction metadata such as LRU recency and LFU counters is not persisted.
+- Because of that, restart recovery rebuilds keys and then applies eviction again from replayed writes.
 
 ### Snapshot
 
@@ -143,6 +147,17 @@ Start the server:
 ./build/kache_server
 ```
 
+Choose an eviction policy explicitly:
+
+```bash
+./build/kache_server --eviction-policy lru
+./build/kache_server --eviction-policy lfu
+```
+
+Default behavior:
+
+- if no flag is passed, Kache starts with `LRU`
+
 The server listens on:
 
 ```text
@@ -170,6 +185,7 @@ The tests cover:
 - `KEYS *` and `FLUSHALL`
 - concurrent `SET` + `GET` stress with 10 threads
 - LRU read-refresh behavior
+- LRU vs LFU comparison under the same access pattern
 - WAL replay restore
 - snapshot restore through `BGSAVE`
 
@@ -242,6 +258,11 @@ Expected:
 - `GET foo` -> `bar`
 - `EXISTS baz` -> `0`
 
+Important note:
+
+- if eviction is enabled and capacity is exceeded during replay, some keys written in `wal.log` may not survive after restart
+- this is expected because WAL records the original write commands, not the final post-eviction in-memory state
+
 ### Snapshot Test
 
 Start the server, then:
@@ -301,10 +322,55 @@ printf "SET a 1\r\n" | nc 127.0.0.1 6380
 printf "GET a\r\n" | nc 127.0.0.1 6380
 ```
 
+## LRU vs LFU
+
+Kache supports two startup-selectable eviction policies:
+
+- `lru`: evict the least recently used key
+- `lfu`: evict the lowest-frequency key, with recency as the tie-breaker
+
+Implementation note:
+
+- `EvictionPolicy` is the strategy interface
+- concrete policies are registered through a small factory registry
+- `InMemoryStorage` resolves the selected policy by name at startup
+
+Startup examples:
+
+```bash
+./build/kache_server --eviction-policy lru
+./build/kache_server --eviction-policy lfu
+```
+
+Comparison pattern used in tests with capacity `3`:
+
+1. `SET a 1`
+2. `SET b 2`
+3. `SET c 3`
+4. `GET a`
+5. `GET a`
+6. `GET b`
+7. `GET c`
+8. `SET d 4`
+
+Survivors under the same pattern:
+
+| Policy | Evicted Key | Surviving Keys |
+| --- | --- | --- |
+| LRU | `a` | `b`, `c`, `d` |
+| LFU | `b` | `a`, `c`, `d` |
+
+Why they differ:
+
+- `LRU` cares only about the most recent touch order, so `a` becomes the oldest key by the time `d` is inserted.
+- `LFU` keeps `a` because it was accessed more times than `b` or `c`; between `b` and `c`, the older one loses on the recency tie-break.
+
 ## Design
 
 - `StorageEngine`: abstract interface for cache operations
 - `InMemoryStorage`: thread-safe sharded in-memory implementation
+- `LRUPolicy` and `LFUPolicy`: pluggable eviction strategies
+- eviction policy construction: registry-backed factory selection
 - `PersistenceManager`: WAL and snapshot read/write logic
 - `CommandHandler`: validates and dispatches parsed commands
 - `RespParser`: converts raw client bytes into command tokens
@@ -318,8 +384,11 @@ This keeps protocol handling, storage, concurrency, and persistence responsibili
 - `KEYS` currently supports only `*`
 - `BGSAVE` is manual, not scheduled automatically
 - snapshot format is intentionally simple, not Redis RDB-compatible
+- LFU metadata is maintained in memory only; restart recovery rebuilds keys but not historical frequencies
+- LRU recency metadata is also not persisted; WAL replay restores writes, not exact pre-restart recency order
 - some older experimental RESP files may still exist in the repository but are not part of the active build path
-- the current default `CACHE_SIZE` in `src/constants/KacheConstants.h` directly affects how many keys remain in memory and therefore what gets written into snapshots
+- the current defaults are centralized in `src/constants/KacheConstants.h`
+- the default cache size directly affects how many keys remain in memory and therefore what gets written into snapshots
 
 ## Author
 

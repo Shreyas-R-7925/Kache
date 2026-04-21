@@ -21,6 +21,7 @@ add_library(kache_parser ${PARSER_SOURCES})
 set(STORAGE_SOURCES
     src/service/PersistenceManager.cpp
     src/service/InMemoryStorage.cpp
+    src/service/LFUPolicy.cpp
     src/service/LRUPolicy.cpp
 )
 

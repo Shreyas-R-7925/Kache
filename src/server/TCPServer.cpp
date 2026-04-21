@@ -8,12 +8,8 @@
 #include <thread>
 #include <unistd.h>
 
+#include "constants/KacheConstants.h"
 #include "parser/RespSerializer.h"
-
-namespace {
-constexpr int kBacklog = 16;
-constexpr size_t kBufferSize = 4096;
-}
 
 TCPServer::TCPServer(int port, std::shared_ptr<CommandHandler> commandHandler)
     : port_(port), commandHandler_(std::move(commandHandler)) {}
@@ -40,7 +36,7 @@ void TCPServer::run() const {
         throw std::runtime_error("Failed to bind socket");
     }
 
-    if (listen(serverFd, kBacklog) < 0) {
+    if (listen(serverFd, kache::constants::kServerBacklog) < 0) {
         close(serverFd);
         throw std::runtime_error("Failed to listen on socket");
     }
@@ -60,7 +56,7 @@ void TCPServer::run() const {
 
 void TCPServer::handleClient(int clientFd) const {
     while (true) {
-        char buffer[kBufferSize] = {0};
+        char buffer[kache::constants::kServerBufferSize] = {0};
         const ssize_t bytesRead = read(clientFd, buffer, sizeof(buffer));
         if (bytesRead <= 0) {
             break;
