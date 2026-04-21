@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -16,10 +17,38 @@
 
 namespace {
 
+struct TempPersistencePaths {
+    std::filesystem::path directory;
+    std::filesystem::path walPath;
+    std::filesystem::path snapshotPath;
+};
+
 void expect(bool condition, const std::string& message) {
     if (!condition) {
         throw std::runtime_error(message);
     }
+}
+
+TempPersistencePaths makeTempPersistencePaths(const std::string& prefix) {
+    const auto uniqueSuffix = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / (prefix + "_" + uniqueSuffix);
+    std::filesystem::create_directories(directory);
+
+    return TempPersistencePaths{
+        directory,
+        directory / "wal.log",
+        directory / "snapshot.rdb",
+    };
+}
+
+std::shared_ptr<InMemoryStorage> makeIsolatedStorage(size_t capacity = CACHE_SIZE) {
+    return std::make_shared<InMemoryStorage>(
+        capacity,
+        LRU_EVICTION_POLICY,
+        "",
+        "");
 }
 
 void expectTokens(const std::vector<std::string>& actual, const std::vector<std::string>& expected, const std::string& testName) {
@@ -47,7 +76,7 @@ void testSerializer() {
 }
 
 void testCommandFlow() {
-    auto storage = std::make_shared<InMemoryStorage>(CACHE_SIZE, LRU_EVICTION_POLICY);
+    auto storage = makeIsolatedStorage();
     CommandHandler handler(storage);
 
     expect(RespSerializer::serialize(handler.handle({"SET", "foo", "bar"})) == "+OK\r\n", "SET failed");
@@ -58,7 +87,7 @@ void testCommandFlow() {
 }
 
 void testExpiryFlow() {
-    auto storage = std::make_shared<InMemoryStorage>(CACHE_SIZE, LRU_EVICTION_POLICY);
+    auto storage = makeIsolatedStorage();
     CommandHandler handler(storage);
 
     handler.handle({"SET", "temp", "value"});
@@ -75,7 +104,7 @@ void testExpiryFlow() {
 }
 
 void testKeysAndFlushAll() {
-    auto storage = std::make_shared<InMemoryStorage>(CACHE_SIZE, LRU_EVICTION_POLICY);
+    auto storage = makeIsolatedStorage();
     CommandHandler handler(storage);
 
     handler.handle({"SET", "alpha", "1"});
@@ -90,7 +119,7 @@ void testKeysAndFlushAll() {
 }
 
 void testConcurrentSetAndGet() {
-    auto storage = std::make_shared<InMemoryStorage>(CACHE_SIZE * 4, LRU_EVICTION_POLICY);
+    auto storage = makeIsolatedStorage(512);
 
     constexpr int threadCount = 10;
     constexpr int operationsPerThread = 500;
@@ -141,7 +170,7 @@ void testConcurrentSetAndGet() {
 }
 
 void testLruReadRefreshesRecency() {
-    auto storage = std::make_shared<InMemoryStorage>(2, LRU_EVICTION_POLICY);
+    auto storage = makeIsolatedStorage(2);
 
     storage->set("a", "1");
     storage->set("b", "2");
@@ -156,6 +185,73 @@ void testLruReadRefreshesRecency() {
     expect(storage->exists("c"), "LRU should keep new key");
 }
 
+void testWalReplayRestoresState() {
+    const TempPersistencePaths paths = makeTempPersistencePaths("kache_wal");
+
+    {
+        auto storage = std::make_shared<InMemoryStorage>(
+            CACHE_SIZE,
+            LRU_EVICTION_POLICY,
+            paths.walPath.string(),
+            paths.snapshotPath.string());
+        CommandHandler handler(storage);
+
+        expect(RespSerializer::serialize(handler.handle({"SET", "foo", "bar"})) == "+OK\r\n", "WAL SET foo failed");
+        expect(RespSerializer::serialize(handler.handle({"SET", "baz", "qux"})) == "+OK\r\n", "WAL SET baz failed");
+        expect(RespSerializer::serialize(handler.handle({"DEL", "baz"})) == ":1\r\n", "WAL DEL failed");
+    }
+
+    {
+        auto storage = std::make_shared<InMemoryStorage>(
+            CACHE_SIZE,
+            LRU_EVICTION_POLICY,
+            paths.walPath.string(),
+            paths.snapshotPath.string());
+        CommandHandler handler(storage);
+
+        expect(RespSerializer::serialize(handler.handle({"GET", "foo"})) == "$3\r\nbar\r\n", "WAL replay missing foo");
+        expect(RespSerializer::serialize(handler.handle({"GET", "baz"})) == "$-1\r\n", "WAL replay restored deleted key");
+    }
+
+    std::filesystem::remove_all(paths.directory);
+}
+
+void testBgsaveRestoresState() {
+    const TempPersistencePaths paths = makeTempPersistencePaths("kache_snapshot");
+
+    {
+        auto storage = std::make_shared<InMemoryStorage>(
+            CACHE_SIZE,
+            LRU_EVICTION_POLICY,
+            paths.walPath.string(),
+            paths.snapshotPath.string());
+        CommandHandler handler(storage);
+
+        expect(RespSerializer::serialize(handler.handle({"SET", "alpha", "1"})) == "+OK\r\n", "snapshot SET alpha failed");
+        expect(RespSerializer::serialize(handler.handle({"SET", "beta", "2"})) == "+OK\r\n", "snapshot SET beta failed");
+        expect(RespSerializer::serialize(handler.handle({"EXPIRE", "beta", "30"})) == ":1\r\n", "snapshot EXPIRE beta failed");
+        expect(RespSerializer::serialize(handler.handle({"BGSAVE"})) == "+OK\r\n", "BGSAVE failed");
+    }
+
+    {
+        auto storage = std::make_shared<InMemoryStorage>(
+            CACHE_SIZE,
+            LRU_EVICTION_POLICY,
+            paths.walPath.string(),
+            paths.snapshotPath.string());
+        CommandHandler handler(storage);
+
+        expect(RespSerializer::serialize(handler.handle({"GET", "alpha"})) == "$1\r\n1\r\n", "snapshot restore missing alpha");
+        expect(RespSerializer::serialize(handler.handle({"GET", "beta"})) == "$1\r\n2\r\n", "snapshot restore missing beta");
+
+        const RespReply ttlReply = handler.handle({"TTL", "beta"});
+        expect(ttlReply.type == RespReplyType::Integer, "snapshot TTL type mismatch");
+        expect(ttlReply.integerValue > 0 && ttlReply.integerValue <= 30, "snapshot TTL replay mismatch");
+    }
+
+    std::filesystem::remove_all(paths.directory);
+}
+
 }  // namespace
 
 int main() {
@@ -168,6 +264,8 @@ int main() {
         testKeysAndFlushAll();
         testConcurrentSetAndGet();
         testLruReadRefreshesRecency();
+        testWalReplayRestoresState();
+        testBgsaveRestoresState();
         std::cout << "All tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& exception) {

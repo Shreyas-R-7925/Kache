@@ -99,7 +99,16 @@ RespReply CommandHandler::handle(const std::vector<std::string>& command) {
         return RespReply::simple("OK");
     }
 
-    return RespReply::error("KACHE - ERR unknown command ");
+    if (verb == "BGSAVE") {
+        if (command.size() != 1) {
+            return RespReply::error("ERR wrong number of arguments for 'BGSAVE' command");
+        }
+
+        storage_->bgsave();
+        return RespReply::simple("OK");
+    }
+
+    return RespReply::error("ERR unknown command");
 }
 
 std::string CommandHandler::uppercase(std::string value) {
