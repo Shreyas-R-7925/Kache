@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "constants/KacheConstants.h"
 #include "EvictionPolicy.h"
 #include "PersistenceManager.h"
 #include "StorageEngine.h"
@@ -21,8 +22,8 @@ public:
     InMemoryStorage(
         size_t cap,
         const std::string& policyType,
-        std::string walPath = "wal.log",
-        std::string snapshotPath = "snapshot.rdb");
+        std::string walPath = kache::constants::kDefaultWalFileName,
+        std::string snapshotPath = kache::constants::kDefaultSnapshotFileName);
     ~InMemoryStorage() override = default;
 
     std::optional<std::string> get(const std::string& key) override;
@@ -37,8 +38,6 @@ public:
     void bgsave() override;
 
 private:
-    static constexpr size_t kShardCount = 16;
-
     struct Entry {
         std::string value;
         std::optional<TimePoint> expiry;
@@ -49,7 +48,7 @@ private:
         std::unordered_map<std::string, Entry> store;
     };
 
-    std::array<Shard, kShardCount> shards_;
+    std::array<Shard, kache::constants::kShardCount> shards_;
     mutable std::mutex metadataMutex_;
     std::unique_ptr<EvictionPolicy> policy_;
     PersistenceManager persistenceManager_;

@@ -38,15 +38,23 @@ TempPersistencePaths makeTempPersistencePaths(const std::string& prefix) {
 
     return TempPersistencePaths{
         directory,
-        directory / "wal.log",
-        directory / "snapshot.rdb",
+        directory / kache::constants::kDefaultWalFileName,
+        directory / kache::constants::kDefaultSnapshotFileName,
     };
 }
 
-std::shared_ptr<InMemoryStorage> makeIsolatedStorage(size_t capacity = CACHE_SIZE) {
+std::shared_ptr<InMemoryStorage> makeIsolatedStorage(size_t capacity = kache::constants::kDefaultCacheSize) {
     return std::make_shared<InMemoryStorage>(
         capacity,
-        LRU_EVICTION_POLICY,
+        kache::constants::kLruEvictionPolicy,
+        "",
+        "");
+}
+
+std::shared_ptr<InMemoryStorage> makeIsolatedStorageWithPolicy(const std::string& policy, size_t capacity) {
+    return std::make_shared<InMemoryStorage>(
+        capacity,
+        policy,
         "",
         "");
 }
@@ -186,12 +194,12 @@ void testLruReadRefreshesRecency() {
 }
 
 void testWalReplayRestoresState() {
-    const TempPersistencePaths paths = makeTempPersistencePaths("kache_wal");
+    const TempPersistencePaths paths = makeTempPersistencePaths(kache::constants::kTempWalPrefix);
 
     {
         auto storage = std::make_shared<InMemoryStorage>(
-            CACHE_SIZE,
-            LRU_EVICTION_POLICY,
+            kache::constants::kDefaultCacheSize,
+            kache::constants::kLruEvictionPolicy,
             paths.walPath.string(),
             paths.snapshotPath.string());
         CommandHandler handler(storage);
@@ -203,8 +211,8 @@ void testWalReplayRestoresState() {
 
     {
         auto storage = std::make_shared<InMemoryStorage>(
-            CACHE_SIZE,
-            LRU_EVICTION_POLICY,
+            kache::constants::kDefaultCacheSize,
+            kache::constants::kLruEvictionPolicy,
             paths.walPath.string(),
             paths.snapshotPath.string());
         CommandHandler handler(storage);
@@ -217,12 +225,12 @@ void testWalReplayRestoresState() {
 }
 
 void testBgsaveRestoresState() {
-    const TempPersistencePaths paths = makeTempPersistencePaths("kache_snapshot");
+    const TempPersistencePaths paths = makeTempPersistencePaths(kache::constants::kTempSnapshotPrefix);
 
     {
         auto storage = std::make_shared<InMemoryStorage>(
-            CACHE_SIZE,
-            LRU_EVICTION_POLICY,
+            kache::constants::kDefaultCacheSize,
+            kache::constants::kLruEvictionPolicy,
             paths.walPath.string(),
             paths.snapshotPath.string());
         CommandHandler handler(storage);
@@ -235,8 +243,8 @@ void testBgsaveRestoresState() {
 
     {
         auto storage = std::make_shared<InMemoryStorage>(
-            CACHE_SIZE,
-            LRU_EVICTION_POLICY,
+            kache::constants::kDefaultCacheSize,
+            kache::constants::kLruEvictionPolicy,
             paths.walPath.string(),
             paths.snapshotPath.string());
         CommandHandler handler(storage);
@@ -252,6 +260,37 @@ void testBgsaveRestoresState() {
     std::filesystem::remove_all(paths.directory);
 }
 
+void runEvictionComparisonPattern(const std::shared_ptr<InMemoryStorage>& storage) {
+    storage->set("a", "1");
+    storage->set("b", "2");
+    storage->set("c", "3");
+
+    expect(storage->get("a").value_or("") == "1", "comparison pattern GET a #1 failed");
+    expect(storage->get("a").value_or("") == "1", "comparison pattern GET a #2 failed");
+    expect(storage->get("b").value_or("") == "2", "comparison pattern GET b failed");
+    expect(storage->get("c").value_or("") == "3", "comparison pattern GET c failed");
+
+    storage->set("d", "4");
+}
+
+void testLruVsLfuComparison() {
+    auto lruStorage = makeIsolatedStorageWithPolicy(kache::constants::kLruEvictionPolicy, 3);
+    auto lfuStorage = makeIsolatedStorageWithPolicy(kache::constants::kLfuEvictionPolicy, 3);
+
+    runEvictionComparisonPattern(lruStorage);
+    runEvictionComparisonPattern(lfuStorage);
+
+    expect(!lruStorage->exists("a"), "LRU should evict a in comparison pattern");
+    expect(lruStorage->exists("b"), "LRU should retain b in comparison pattern");
+    expect(lruStorage->exists("c"), "LRU should retain c in comparison pattern");
+    expect(lruStorage->exists("d"), "LRU should retain d in comparison pattern");
+
+    expect(lfuStorage->exists("a"), "LFU should retain a in comparison pattern");
+    expect(!lfuStorage->exists("b"), "LFU should evict b in comparison pattern");
+    expect(lfuStorage->exists("c"), "LFU should retain c in comparison pattern");
+    expect(lfuStorage->exists("d"), "LFU should retain d in comparison pattern");
+}
+
 }  // namespace
 
 int main() {
@@ -264,6 +303,7 @@ int main() {
         testKeysAndFlushAll();
         testConcurrentSetAndGet();
         testLruReadRefreshesRecency();
+        testLruVsLfuComparison();
         testWalReplayRestoresState();
         testBgsaveRestoresState();
         std::cout << "All tests passed\n";

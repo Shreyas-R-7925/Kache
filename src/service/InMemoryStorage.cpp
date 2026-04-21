@@ -6,7 +6,39 @@
 #include <stdexcept>
 
 #include "../constants/KacheConstants.h"
+#include "LFUPolicy.h"
 #include "LRUPolicy.h"
+
+namespace {
+
+using EvictionPolicyFactory = std::unique_ptr<EvictionPolicy> (*)();
+
+std::unique_ptr<EvictionPolicy> makeLruPolicy() {
+    return std::make_unique<LRUPolicy>();
+}
+
+std::unique_ptr<EvictionPolicy> makeLfuPolicy() {
+    return std::make_unique<LFUPolicy>();
+}
+
+const std::unordered_map<std::string, EvictionPolicyFactory>& evictionPolicyRegistry() {
+    static const std::unordered_map<std::string, EvictionPolicyFactory> registry = {
+        {kache::constants::kLruEvictionPolicy, &makeLruPolicy},
+        {kache::constants::kLfuEvictionPolicy, &makeLfuPolicy},
+    };
+    return registry;
+}
+
+std::unique_ptr<EvictionPolicy> createEvictionPolicy(const std::string& policyType) {
+    const auto& registry = evictionPolicyRegistry();
+    const auto it = registry.find(policyType);
+    if (it != registry.end()) {
+        return it->second();
+    }
+    throw std::invalid_argument("Unsupported eviction policy");
+}
+
+}  // namespace
 
 InMemoryStorage::InMemoryStorage(
     size_t cap,
@@ -14,11 +46,7 @@ InMemoryStorage::InMemoryStorage(
     std::string walPath,
     std::string snapshotPath)
     : persistenceManager_(std::move(walPath), std::move(snapshotPath)), capacity_(cap) {
-    if (policyType == LRU_EVICTION_POLICY) {
-        policy_ = std::make_unique<LRUPolicy>();
-    } else {
-        throw std::invalid_argument("Unsupported eviction policy");
-    }
+    policy_ = createEvictionPolicy(policyType);
 
     restoreFromPersistence();
 }
@@ -196,7 +224,7 @@ bool InMemoryStorage::isExpired(const Entry& entry, TimePoint now) const {
 }
 
 size_t InMemoryStorage::shardIndexFor(const std::string& key) const {
-    return std::hash<std::string>{}(key) % kShardCount;
+    return std::hash<std::string>{}(key) % kache::constants::kShardCount;
 }
 
 InMemoryStorage::Shard& InMemoryStorage::shardFor(const std::string& key) {
