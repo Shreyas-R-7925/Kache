@@ -1,6 +1,6 @@
 # Kache
 
-Kache is a lightweight in-memory key-value store inspired by Redis. It now exposes a Redis-compatible TCP interface on port `6380`, parses RESP requests, dispatches commands through a storage engine, and returns RESP responses that work with `redis-cli`.
+Kache is a lightweight in-memory key-value store inspired by Redis. It exposes a Redis-compatible TCP interface on port `6380`, parses RESP requests, dispatches commands through a storage engine, and returns RESP responses that work with `redis-cli`.
 
 ## Current Capabilities
 
@@ -16,8 +16,12 @@ Kache is a lightweight in-memory key-value store inspired by Redis. It now expos
   - integers
   - arrays
   - null bulk strings
-- LRU-backed in-memory storage
+- Thread-safe sharded in-memory storage
+- LRU eviction
 - TTL and expiry support
+- WAL persistence through `wal.log`
+- Snapshot persistence through `snapshot.rdb`
+- Snapshot restore + WAL replay on startup
 
 ## Supported Commands
 
@@ -29,6 +33,7 @@ Kache is a lightweight in-memory key-value store inspired by Redis. It now expos
 - `TTL key`
 - `KEYS *`
 - `FLUSHALL`
+- `BGSAVE`
 
 ## Project Structure
 
@@ -37,6 +42,7 @@ Kache/
 ├── include/
 │   ├── CommandHandler.h
 │   ├── InMemoryStorage.h
+│   ├── PersistenceManager.h
 │   ├── StorageEngine.h
 │   ├── parser/
 │   └── server/
@@ -46,6 +52,7 @@ Kache/
 │   └── service/
 ├── tests/
 ├── CMakeLists.txt
+├── DESIGN.md
 └── README.md
 ```
 
@@ -62,6 +69,56 @@ redis-cli -p 6380 EXISTS foo
 ```
 
 This becomes a RESP request, gets parsed into tokens like `["EXISTS", "foo"]`, is dispatched through `CommandHandler`, checked in `InMemoryStorage`, serialized into an integer RESP reply, and sent back to the client.
+
+## Concurrency Model
+
+- The TCP server accepts clients and handles each connection in its own worker thread.
+- `InMemoryStorage` uses `16` shards.
+- Each shard has its own `std::shared_mutex`.
+- A small metadata mutex protects shared eviction bookkeeping and size accounting.
+
+This reduces contention compared with one global lock while keeping the LRU path correct.
+
+## Persistence Model
+
+Kache keeps the live dataset in memory. Persistence is used for restart recovery.
+
+### WAL
+
+- Every write command is appended to `wal.log`.
+- Example entries:
+
+```text
+SET foo bar
+DEL baz
+EXPIREAT temp 1776771002045
+FLUSHALL
+```
+
+- On startup, Kache replays the WAL to rebuild the latest state.
+
+### Snapshot
+
+- `BGSAVE` writes the current in-memory dataset to `snapshot.rdb`.
+- The snapshot format is a simple line-based format:
+
+```text
+KACHE_SNAPSHOT_V1
+alpha 1 -1
+temp value 1776771002045
+```
+
+- `-1` means the key has no expiry.
+- Any other value is an absolute expiry timestamp in epoch milliseconds.
+
+### Startup Recovery
+
+On startup, Kache restores state in this order:
+
+1. load `snapshot.rdb`
+2. replay `wal.log`
+
+This matches the usual snapshot + append-log recovery model.
 
 ## Build
 
@@ -94,7 +151,7 @@ The server listens on:
 
 ## Testing
 
-### Unit Tests
+### Automated Tests
 
 Run the test suite:
 
@@ -111,8 +168,12 @@ The tests cover:
 - command dispatch behavior
 - expiry and TTL behavior
 - `KEYS *` and `FLUSHALL`
+- concurrent `SET` + `GET` stress with 10 threads
+- LRU read-refresh behavior
+- WAL replay restore
+- snapshot restore through `BGSAVE`
 
-### Manual Testing with redis-cli
+### Basic Manual Testing
 
 Start the server in one terminal:
 
@@ -144,6 +205,93 @@ Expected behavior:
 - `DEL foo` returns `1`
 - `FLUSHALL` returns `OK`
 
+### WAL Test
+
+Remove old persistence files first:
+
+```bash
+rm -f wal.log snapshot.rdb
+```
+
+Start the server, then:
+
+```bash
+redis-cli -p 6380 SET foo bar
+redis-cli -p 6380 SET baz qux
+redis-cli -p 6380 DEL baz
+cat wal.log
+```
+
+Expected WAL contents:
+
+```text
+SET foo bar
+SET baz qux
+DEL baz
+```
+
+Restart the server and verify:
+
+```bash
+redis-cli -p 6380 --raw GET foo
+redis-cli -p 6380 EXISTS baz
+```
+
+Expected:
+
+- `GET foo` -> `bar`
+- `EXISTS baz` -> `0`
+
+### Snapshot Test
+
+Start the server, then:
+
+```bash
+redis-cli -p 6380 SET alpha 1
+redis-cli -p 6380 SET beta 2
+redis-cli -p 6380 BGSAVE
+cat snapshot.rdb
+```
+
+Restart the server and verify:
+
+```bash
+redis-cli -p 6380 --raw GET alpha
+redis-cli -p 6380 --raw GET beta
+```
+
+Expected:
+
+- `GET alpha` -> `1`
+- `GET beta` -> `2`
+
+### TTL Persistence Test
+
+```bash
+rm -f wal.log snapshot.rdb
+./build/kache_server
+```
+
+Then:
+
+```bash
+redis-cli -p 6380 SET temp value
+redis-cli -p 6380 EXPIRE temp 30
+redis-cli -p 6380 BGSAVE
+```
+
+Restart the server, then:
+
+```bash
+redis-cli -p 6380 TTL temp
+redis-cli -p 6380 --raw GET temp
+```
+
+Expected:
+
+- `TTL temp` returns a positive number
+- `GET temp` returns `value` until the key expires
+
 ### Inline Command Testing
 
 You can also test raw inline commands:
@@ -156,20 +304,22 @@ printf "GET a\r\n" | nc 127.0.0.1 6380
 ## Design
 
 - `StorageEngine`: abstract interface for cache operations
-- `InMemoryStorage`: in-memory implementation using `unordered_map`
+- `InMemoryStorage`: thread-safe sharded in-memory implementation
+- `PersistenceManager`: WAL and snapshot read/write logic
 - `CommandHandler`: validates and dispatches parsed commands
 - `RespParser`: converts raw client bytes into command tokens
 - `RespSerializer`: converts command results into RESP replies
 - `TCPServer`: owns the socket lifecycle and request/response loop
 
-This keeps the Redis protocol handling separate from storage concerns and makes each layer easier to test independently.
+This keeps protocol handling, storage, concurrency, and persistence responsibilities separated enough to test each part independently.
 
 ## Current Limitations
 
 - `KEYS` currently supports only `*`
-- persistence is not implemented
-- the server handles clients in a simple sequential loop
+- `BGSAVE` is manual, not scheduled automatically
+- snapshot format is intentionally simple, not Redis RDB-compatible
 - some older experimental RESP files may still exist in the repository but are not part of the active build path
+- the current default `CACHE_SIZE` in `src/constants/KacheConstants.h` directly affects how many keys remain in memory and therefore what gets written into snapshots
 
 ## Author
 

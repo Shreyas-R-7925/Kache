@@ -11,13 +11,18 @@
 #include <vector>
 
 #include "EvictionPolicy.h"
+#include "PersistenceManager.h"
 #include "StorageEngine.h"
 
-using TimePoint = std::chrono::steady_clock::time_point;
+using TimePoint = std::chrono::system_clock::time_point;
 
 class InMemoryStorage : public StorageEngine {
 public:
-    InMemoryStorage(size_t cap, const std::string& policyType);
+    InMemoryStorage(
+        size_t cap,
+        const std::string& policyType,
+        std::string walPath = "wal.log",
+        std::string snapshotPath = "snapshot.rdb");
     ~InMemoryStorage() override = default;
 
     std::optional<std::string> get(const std::string& key) override;
@@ -29,6 +34,7 @@ public:
     long ttl(const std::string& key) override;
     std::vector<std::string> keys(const std::string& pattern) override;
     void flushAll() override;
+    void bgsave() override;
 
 private:
     static constexpr size_t kShardCount = 16;
@@ -46,8 +52,10 @@ private:
     std::array<Shard, kShardCount> shards_;
     mutable std::mutex metadataMutex_;
     std::unique_ptr<EvictionPolicy> policy_;
+    PersistenceManager persistenceManager_;
     size_t capacity_;
     size_t size_ = 0;
+    bool replaying_ = false;
 
     bool isExpired(const Entry& entry, TimePoint now) const;
     size_t shardIndexFor(const std::string& key) const;
@@ -56,4 +64,10 @@ private:
     bool purgeIfExpiredLocked(Shard& shard, const std::string& key, TimePoint now);
     bool eraseLocked(Shard& shard, const std::string& key);
     void setInternal(const std::string& key, const std::string& value, std::optional<TimePoint> expiry);
+    void setInternalLocked(const std::string& key, const std::string& value, std::optional<TimePoint> expiry);
+    void restoreFromPersistence();
+    void appendWalCommand(const std::vector<std::string>& tokens);
+    void restoreSet(const std::string& key, const std::string& value, std::optional<TimePoint> expiry);
+    void expireAt(const std::string& key, TimePoint expiry);
+    std::vector<PersistenceManager::SnapshotRecord> snapshotRecordsLocked(TimePoint now) const;
 };

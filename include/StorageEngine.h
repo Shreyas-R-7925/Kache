@@ -18,4 +18,5 @@ public:
     virtual long ttl(const std::string& key) = 0;
     virtual std::vector<std::string> keys(const std::string& pattern) = 0;
     virtual void flushAll() = 0;
+    virtual void bgsave() = 0;
 };
