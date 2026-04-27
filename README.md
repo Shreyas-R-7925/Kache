@@ -1,110 +1,110 @@
 # Kache
 
-Kache is a lightweight in-memory key-value store inspired by Redis. It exposes a Redis-compatible TCP interface on port `6380`, parses RESP requests, dispatches commands through a storage engine, and returns RESP responses that work with `redis-cli`.
+Kache is a Redis-compatible in-memory key-value store written in C++. It exposes a RESP-speaking TCP server on `127.0.0.1:6380`, supports pluggable eviction policies (`LRU` and `LFU`), handles TTL expiry on access, and persists writes through a write-ahead log plus snapshot recovery.
 
-## Current Capabilities
+## Features
 
-- In-memory key-value storage
 - Redis-compatible TCP server on port `6380`
-- RESP parsing for:
-  - inline commands like `SET foo bar`
-  - array commands like `*3\r\n$3\r\nSET...`
-- RESP serialization for:
-  - simple strings
-  - bulk strings
-  - errors
-  - integers
-  - arrays
-  - null bulk strings
-- Thread-safe sharded in-memory storage
-- Configurable `LRU` or `LFU` eviction
-- Registry-based eviction policy selection
-- TTL and expiry support
-- WAL persistence through `wal.log`
-- Snapshot persistence through `snapshot.rdb`
-- Snapshot restore + WAL replay on startup
+- RESP parsing for inline and array-style requests
+- Supported commands: `SET`, `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL`, `KEYS *`, `FLUSHALL`, `BGSAVE`
+- Thread-safe sharded in-memory storage using `16` shards
+- Pluggable eviction policies through a strategy interface
+- TTL support with lazy expiry checks on reads and metadata commands
+- Write-ahead log persistence in `wal.log`
+- Snapshot persistence in `snapshot.rdb`
+- Restart recovery by loading snapshot first and replaying WAL second
 
-## Supported Commands
+## Architecture
 
-- `SET key value`
-- `GET key`
-- `DEL key [key ...]`
-- `EXISTS key [key ...]`
-- `EXPIRE key seconds`
-- `TTL key`
-- `KEYS *`
-- `FLUSHALL`
-- `BGSAVE`
-
-## Project Structure
-
-```text
-Kache/
-├── include/
-│   ├── CommandHandler.h
-│   ├── InMemoryStorage.h
-│   ├── PersistenceManager.h
-│   ├── StorageEngine.h
-│   ├── parser/
-│   └── server/
-├── src/
-│   ├── constants/
-│   ├── server/
-│   └── service/
-├── tests/
-├── CMakeLists.txt
-├── DESIGN.md
-└── README.md
-```
-
-## Request Flow
-
-When a Redis client sends a command, the code path is:
+The request path is:
 
 `TCP server -> RESP parser -> CommandHandler -> StorageEngine -> RESP serializer -> TCP response`
 
-Example:
+Main components:
 
-```text
-redis-cli -p 6380 EXISTS foo
-```
+- `TCPServer`: accepts client connections and runs the socket request/response loop
+- `RespParser`: converts raw bytes into command tokens
+- `CommandHandler`: validates command shape and dispatches to storage
+- `InMemoryStorage`: sharded, thread-safe storage implementation
+- `EvictionPolicy`: strategy interface used by `LRU` and `LFU`
+- `PersistenceManager`: WAL append, snapshot write, snapshot load, WAL replay
 
-This becomes a RESP request, gets parsed into tokens like `["EXISTS", "foo"]`, is dispatched through `CommandHandler`, checked in `InMemoryStorage`, serialized into an integer RESP reply, and sent back to the client.
+## Supported Commands
+
+| Command | Behavior |
+| --- | --- |
+| `SET key value` | Store or overwrite a value |
+| `GET key` | Return the value or null bulk string |
+| `DEL key [key ...]` | Delete one or more keys |
+| `EXISTS key [key ...]` | Count keys that exist |
+| `EXPIRE key seconds` | Attach a TTL in seconds |
+| `TTL key` | Return remaining TTL, `-1`, or `-2` |
+| `KEYS *` | Return all live keys |
+| `FLUSHALL` | Clear the in-memory dataset |
+| `BGSAVE` | Write a snapshot and truncate the WAL |
 
 ## Concurrency Model
 
-- The TCP server accepts clients and handles each connection in its own worker thread.
-- `InMemoryStorage` uses `16` shards.
-- Each shard has its own `std::shared_mutex`.
-- A small metadata mutex protects shared eviction bookkeeping and size accounting.
+- The TCP server handles each client connection in its own worker thread.
+- Storage is split into `16` shards.
+- Each shard owns its own `std::shared_mutex`.
+- A small metadata mutex protects global size accounting and eviction bookkeeping.
 
-This reduces contention compared with one global lock while keeping the LRU path correct.
+This keeps read/write contention lower than a single global storage lock while preserving consistent eviction state.
+
+## Eviction Policies
+
+Kache supports two startup-selectable eviction policies:
+
+- `LRU`: evict the least recently used key
+- `LFU`: evict the least frequently used key, with recency as a tie-breaker
+
+Start the server with either policy:
+
+```bash
+./build/kache_server --eviction-policy lru
+./build/kache_server --eviction-policy lfu
+```
+
+If no flag is passed, the server defaults to `LRU`.
+
+## TTL Behavior
+
+TTL is supported through `EXPIRE` and `TTL`.
+
+- Expiry timestamps are stored as absolute time points
+- Expired keys are purged when touched by operations such as `GET`, `EXISTS`, and `TTL`
+- Snapshot and WAL recovery preserve TTL state across restarts
+
+Important: expiry is currently lazy. There is no background active expiry sweeper in the current implementation.
 
 ## Persistence Model
 
-Kache keeps the live dataset in memory. Persistence is used for restart recovery.
+Kache keeps the live dataset in memory and uses persistence for restart recovery.
 
 ### WAL
 
-- Every write command is appended to `wal.log`.
-- Example entries:
+- Write commands are appended to `wal.log`
+- TTL writes are persisted as `SET` followed by `EXPIREAT`
+- `FLUSHALL` is also written to the WAL
+
+Example WAL contents:
 
 ```text
 SET foo bar
-DEL baz
+SET temp value
 EXPIREAT temp 1776771002045
-FLUSHALL
+DEL foo
 ```
-
-- On startup, Kache replays the WAL to rebuild the latest state.
-- WAL stores write history, not a final materialized cache image.
-- Runtime eviction metadata such as LRU recency and LFU counters is not persisted.
-- Because of that, restart recovery rebuilds keys and then applies eviction again from replayed writes.
 
 ### Snapshot
 
-- `BGSAVE` writes the current in-memory dataset to `snapshot.rdb`.
-- The snapshot format is a simple line-based format:
+- `BGSAVE` writes the current live dataset to `snapshot.rdb`
+- Snapshot format is a simple line-based format owned by this project
+- The first line is a format header: `KACHE_SNAPSHOT_V1`
+- Each remaining line stores `key value expiry_epoch_ms_or_-1`
+
+Example snapshot:
 
 ```text
 KACHE_SNAPSHOT_V1
@@ -112,17 +112,43 @@ alpha 1 -1
 temp value 1776771002045
 ```
 
-- `-1` means the key has no expiry.
-- Any other value is an absolute expiry timestamp in epoch milliseconds.
+### Recovery Order
 
-### Startup Recovery
+On startup Kache restores state in this order:
 
-On startup, Kache restores state in this order:
+1. Load `snapshot.rdb`
+2. Replay `wal.log`
 
-1. load `snapshot.rdb`
-2. replay `wal.log`
+### Current Persistence Notes
 
-This matches the usual snapshot + append-log recovery model.
+- `BGSAVE` is currently synchronous despite the Redis-like command name
+- Eviction metadata is not persisted
+- Restart recovery restores keys and TTLs, but not exact pre-restart LRU/LFU history
+
+## Project Layout
+
+```text
+Kache/
+├── include/
+│   ├── parser/
+│   ├── server/
+│   ├── CommandHandler.h
+│   ├── EvictionPolicy.h
+│   ├── InMemoryStorage.h
+│   ├── LFUPolicy.h
+│   ├── LRUPolicy.h
+│   ├── PersistenceManager.h
+│   └── StorageEngine.h
+├── src/
+│   ├── constants/
+│   ├── server/
+│   └── service/
+├── tests/
+├── bench/
+├── CMakeLists.txt
+├── DESIGN.md
+└── README.md
+```
 
 ## Build
 
@@ -130,9 +156,10 @@ This matches the usual snapshot + append-log recovery model.
 
 - C++17 or newer
 - CMake 3.10+
-- `redis-cli` for end-to-end verification
+- `redis-cli` for manual verification
+- `redis-benchmark` for network benchmarks
 
-### Commands
+### Build Commands
 
 ```bash
 cmake -S . -B build
@@ -147,35 +174,29 @@ Start the server:
 ./build/kache_server
 ```
 
-Choose an eviction policy explicitly:
-
-```bash
-./build/kache_server --eviction-policy lru
-./build/kache_server --eviction-policy lfu
-```
-
-Default behavior:
-
-- if no flag is passed, Kache starts with `LRU`
-
 The server listens on:
 
 ```text
 127.0.0.1:6380
 ```
 
+Start with a specific eviction policy:
+
+```bash
+./build/kache_server --eviction-policy lru
+./build/kache_server --eviction-policy lfu
+```
+
 ## Testing
 
-### Automated Tests
-
-Run the test suite:
+Run the automated test binary:
 
 ```bash
 ctest --test-dir build --output-on-failure
 ./build/kache_tests
 ```
 
-The tests cover:
+Covered areas include:
 
 - inline RESP parsing
 - array RESP parsing
@@ -183,13 +204,13 @@ The tests cover:
 - command dispatch behavior
 - expiry and TTL behavior
 - `KEYS *` and `FLUSHALL`
-- concurrent `SET` + `GET` stress with 10 threads
+- concurrent `SET` and `GET` stress
 - LRU read-refresh behavior
-- LRU vs LFU comparison under the same access pattern
+- LRU vs LFU eviction differences
 - WAL replay restore
 - snapshot restore through `BGSAVE`
 
-### Basic Manual Testing
+## Manual Verification
 
 Start the server in one terminal:
 
@@ -197,7 +218,7 @@ Start the server in one terminal:
 ./build/kache_server
 ```
 
-In another terminal:
+Then run these commands in another terminal:
 
 ```bash
 redis-cli -p 6380 SET foo bar
@@ -210,20 +231,22 @@ redis-cli -p 6380 DEL foo
 redis-cli -p 6380 FLUSHALL
 ```
 
-Expected behavior:
+Expected results:
 
 - `SET foo bar` returns `OK`
 - `GET foo` returns `bar`
 - `EXISTS foo` returns `1`
 - `EXPIRE foo 10` returns `1`
-- `TTL foo` returns a number near `10`
+- `TTL foo` returns a value near `10`
 - `KEYS '*'` includes `foo`
 - `DEL foo` returns `1`
 - `FLUSHALL` returns `OK`
 
-### WAL Test
+## Persistence Checks
 
-Remove old persistence files first:
+### WAL Check
+
+Remove any old persistence files:
 
 ```bash
 rm -f wal.log snapshot.rdb
@@ -255,15 +278,10 @@ redis-cli -p 6380 EXISTS baz
 
 Expected:
 
-- `GET foo` -> `bar`
-- `EXISTS baz` -> `0`
+- `GET foo` returns `bar`
+- `EXISTS baz` returns `0`
 
-Important note:
-
-- if eviction is enabled and capacity is exceeded during replay, some keys written in `wal.log` may not survive after restart
-- this is expected because WAL records the original write commands, not the final post-eviction in-memory state
-
-### Snapshot Test
+### Snapshot Check
 
 Start the server, then:
 
@@ -283,10 +301,10 @@ redis-cli -p 6380 --raw GET beta
 
 Expected:
 
-- `GET alpha` -> `1`
-- `GET beta` -> `2`
+- `GET alpha` returns `1`
+- `GET beta` returns `2`
 
-### TTL Persistence Test
+### TTL Persistence Check
 
 ```bash
 rm -f wal.log snapshot.rdb
@@ -301,7 +319,7 @@ redis-cli -p 6380 EXPIRE temp 30
 redis-cli -p 6380 BGSAVE
 ```
 
-Restart the server, then:
+Restart the server and verify:
 
 ```bash
 redis-cli -p 6380 TTL temp
@@ -310,85 +328,52 @@ redis-cli -p 6380 --raw GET temp
 
 Expected:
 
-- `TTL temp` returns a positive number
+- `TTL temp` returns a positive value
 - `GET temp` returns `value` until the key expires
 
-### Inline Command Testing
+## Benchmarking
 
-You can also test raw inline commands:
+The exact numbers you report depend on machine, compiler flags, and dataset size.
 
-```bash
-printf "SET a 1\r\n" | nc 127.0.0.1 6380
-printf "GET a\r\n" | nc 127.0.0.1 6380
-```
+Important: the current source default cache capacity is `3` in `src/constants/KacheConstants.h`. That is useful for eviction testing, but it is not a realistic benchmark capacity. For meaningful network benchmarks, increase the default capacity or expose capacity as a runtime flag before benchmarking large key ranges.
 
-## LRU vs LFU
+Baseline benchmark flow:
 
-Kache supports two startup-selectable eviction policies:
+1. Start the server
+2. Clear existing data
+3. Preload keys for `GET`
+4. Run `GET` and `SET` with `4` concurrent clients
 
-- `lru`: evict the least recently used key
-- `lfu`: evict the lowest-frequency key, with recency as the tie-breaker
-
-Implementation note:
-
-- `EvictionPolicy` is the strategy interface
-- concrete policies are registered through a small factory registry
-- `InMemoryStorage` resolves the selected policy by name at startup
-
-Startup examples:
+Commands:
 
 ```bash
 ./build/kache_server --eviction-policy lru
-./build/kache_server --eviction-policy lfu
+redis-cli -p 6380 FLUSHALL
+redis-benchmark -p 6380 -t set -n 100000 -r 100000 -c 8 -q
+redis-benchmark -p 6380 -t get -n 100000 -c 4 -r 100000 --csv
+redis-benchmark -p 6380 -t set -n 100000 -c 4 -r 100000 --csv
 ```
 
-Comparison pattern used in tests with capacity `3`:
+For steadier numbers, repeat each benchmark three times and average throughput:
 
-1. `SET a 1`
-2. `SET b 2`
-3. `SET c 3`
-4. `GET a`
-5. `GET a`
-6. `GET b`
-7. `GET c`
-8. `SET d 4`
+```bash
+redis-benchmark -p 6380 -t get -n 100000 -c 4 -r 100000 --csv
+redis-benchmark -p 6380 -t get -n 100000 -c 4 -r 100000 --csv
+redis-benchmark -p 6380 -t get -n 100000 -c 4 -r 100000 --csv
 
-Survivors under the same pattern:
+redis-benchmark -p 6380 -t set -n 100000 -c 4 -r 100000 --csv
+redis-benchmark -p 6380 -t set -n 100000 -c 4 -r 100000 --csv
+redis-benchmark -p 6380 -t set -n 100000 -c 4 -r 100000 --csv
+```
 
-| Policy | Evicted Key | Surviving Keys |
-| --- | --- | --- |
-| LRU | `a` | `b`, `c`, `d` |
-| LFU | `b` | `a`, `c`, `d` |
-
-Why they differ:
-
-- `LRU` cares only about the most recent touch order, so `a` becomes the oldest key by the time `d` is inserted.
-- `LFU` keeps `a` because it was accessed more times than `b` or `c`; between `b` and `c`, the older one loses on the recency tie-break.
-
-## Design
-
-- `StorageEngine`: abstract interface for cache operations
-- `InMemoryStorage`: thread-safe sharded in-memory implementation
-- `LRUPolicy` and `LFUPolicy`: pluggable eviction strategies
-- eviction policy construction: registry-backed factory selection
-- `PersistenceManager`: WAL and snapshot read/write logic
-- `CommandHandler`: validates and dispatches parsed commands
-- `RespParser`: converts raw client bytes into command tokens
-- `RespSerializer`: converts command results into RESP replies
-- `TCPServer`: owns the socket lifecycle and request/response loop
-
-This keeps protocol handling, storage, concurrency, and persistence responsibilities separated enough to test each part independently.
-
-## Current Limitations
+## Limitations
 
 - `KEYS` currently supports only `*`
-- `BGSAVE` is manual, not scheduled automatically
-- snapshot format is intentionally simple, not Redis RDB-compatible
-- LFU metadata is maintained in memory only; restart recovery rebuilds keys but not historical frequencies
-- LRU recency metadata is also not persisted; WAL replay restores writes, not exact pre-restart recency order
-- some older experimental RESP files may still exist in the repository but are not part of the active build path
-- the current defaults are centralized in `src/constants/KacheConstants.h`
-- the default cache size directly affects how many keys remain in memory and therefore what gets written into snapshots
+- `BGSAVE` is synchronous
+- Snapshot format is project-specific, not Redis RDB-compatible
+- Eviction metadata is not persisted across restarts
+- Expiry is lazy; there is no background active expiry loop
+- Default cache capacity is currently tuned for eviction tests, not production-like workloads
 
 ## Author
 
